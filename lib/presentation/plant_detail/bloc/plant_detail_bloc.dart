@@ -1,0 +1,849 @@
+import 'dart:async';
+import 'dart:math' as math;
+import 'package:bloc_concurrency/bloc_concurrency.dart';
+import 'package:flutter/foundation.dart';
+import 'package:flutter_bloc/flutter_bloc.dart';
+import '../../../domain/model/power_plant.dart';
+import '../../../core/enums/plant_type.dart';
+import '../../../domain/model/climate_data.dart';
+import '../../../domain/model/cvs_result.dart';
+import '../../../domain/model/plant_context_payload.dart';
+import '../../../domain/model/lg_settings.dart';
+import '../../../service/lg_service.dart';
+import '../../../domain/usecases/cvs/services/get_unified_score_usecase.dart';
+import '../../../domain/usecases/cvs/services/get_cvs_for_plant_usecase.dart';
+import '../../../domain/usecases/ai/services/generate_plant_insight_usecase.dart';
+import '../../../domain/usecases/ai/services/generate_scenario_analysis_usecase.dart';
+import '../../../domain/usecases/climate/services/get_multi_year_trend_usecase.dart';
+import '../../../domain/usecases/ai/services/generate_trend_insight_usecase.dart';
+import '../../../domain/usecases/ai/services/start_plant_chat_usecase.dart';
+import '../../../domain/usecases/ai/services/send_chat_message_usecase.dart';
+import '../../../core/resources/data_state.dart';
+import '../../../core/resources/app_state.dart';
+import '../../../domain/repository/cvs_repository.dart';
+import '../../../core/enums/connection_status.dart';
+import '../../../core/enums/lg_display_mode.dart';
+import '../../../core/enums/historical_data_mode.dart';
+import '../../../core/utils/kml_utils.dart';
+import '../../../service/power_plant_orbit_service.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'plant_detail_event.dart';
+import 'plant_detail_data.dart';
+
+class PlantDetailBloc
+    extends Bloc<PlantDetailEvent, AppState<PlantDetailData>> {
+  final LGService lgService;
+  final GetUnifiedScoreUsecase getUnifiedScoreUsecase;
+  final GetCvsForPlantUsecase getCvsForPlantUsecase;
+  final GeneratePlantInsightUsecase generatePlantInsightUsecase;
+  final GenerateScenarioAnalysisUsecase generateScenarioAnalysisUsecase;
+  final GetMultiYearTrendUsecase getMultiYearTrendUsecase;
+  final GenerateTrendInsightUsecase generateTrendInsightUsecase;
+  final StartPlantChatUsecase startPlantChatUsecase;
+  final SendChatMessageUsecase sendChatMessageUsecase;
+  String? _chatSessionId;
+  PlantDetailBloc({
+    required this.lgService,
+    required this.getUnifiedScoreUsecase,
+    required this.getCvsForPlantUsecase,
+    required this.generatePlantInsightUsecase,
+    required this.generateScenarioAnalysisUsecase,
+    required this.getMultiYearTrendUsecase,
+    required this.generateTrendInsightUsecase,
+    required this.startPlantChatUsecase,
+    required this.sendChatMessageUsecase,
+  }) : super(const AppLoading()) {
+    on<PlantDetailLoadRequested>(_onLoadRequested);
+    on<PlantDetailGenerateInsightRequested>(
+      _onGenerateInsightRequested,
+      transformer: restartable(),
+    );
+    on<PlantDetailScenarioInsightRequested>(
+      _onScenarioInsightRequested,
+      transformer: restartable(),
+    );
+    on<PlantDetailTrendRequested>(_onTrendRequested);
+    on<PlantDetailTrendInsightRequested>(
+      _onTrendInsightRequested,
+      transformer: restartable(),
+    );
+    on<PlantDetailChatStarted>(_onChatStarted);
+    on<PlantDetailChatEnded>(_onChatEnded);
+    on<PlantDetailChatMessageSent>(_onChatMessageSent);
+    on<PlantDetailDismissInsight>(_onDismissInsight);
+    on<PlantDetailClearLGError>((event, emit) {
+      if (state is AppSuccess<PlantDetailData>) {
+        final data = (state as AppSuccess<PlantDetailData>).data!;
+        emit(AppSuccess(data.copyWith(clearLgError: true)));
+      }
+    });
+    on<PlantDetailStartOrbitRequested>(_onStartOrbitRequested);
+    on<PlantDetailStopOrbitRequested>(_onStopOrbitRequested);
+    on<PlantDetailSetOrbitReady>(_onSetOrbitReady);
+
+    // Auto-reset orbiting state when the plant orbit tour finishes naturally.
+    lgService.onPlantOrbitComplete = () {
+      if (!isClosed && state is AppSuccess<PlantDetailData>) {
+        add(const PlantDetailStopOrbitRequested());
+      }
+    };
+  }
+
+  @override
+  Future<void> close() {
+    lgService.onPlantOrbitComplete = null;
+    lgService.stopPlantOrbit();
+    return super.close();
+  }
+  PlantContextPayload? _buildContext() {
+    if (state is! AppSuccess<PlantDetailData>) return null;
+    final s = (state as AppSuccess<PlantDetailData>).data!;
+    if (s.cvsResult == null) return null;
+    return PlantContextPayload.fromEntities(
+      plant: s.plant,
+      cvs: s.cvsResult!,
+      trendData: s.trendData.isNotEmpty ? s.trendData : null,
+      activeScenarioType: s.scenarioInsight != null ? 'Custom' : null,
+      scenarioProjectedCvs: s.projectedCvs,
+    );
+  }
+
+  Future<void> _onLoadRequested(
+    PlantDetailLoadRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    emit(const AppLoading<PlantDetailData>());
+    final plant = event.plant;
+    final activeCvs = getUnifiedScoreUsecase(plant);
+    emit(
+      AppSuccess<PlantDetailData>(
+        PlantDetailData(
+          plant: plant,
+          cvsResult: activeCvs,
+          isLoadingCvs: false,
+          isLoadingInsight: false,
+        ),
+      ),
+    );
+    // Await the LG fly-to + KML sequence BEFORE starting the CVS stream.
+    // Running both concurrently caused SFTP channel races that silently
+    // dropped the plant KML (LG stayed stuck on the region view).
+    await _triggerPlantLGSequence(plant, activeCvs, emit);
+    await emit.forEach<DataState<CvsComputationResult>>(
+      getCvsForPlantUsecase(params: plant),
+      onData: (dataState) {
+        if (dataState is DataLoading<CvsComputationResult>) {
+          if (state is AppSuccess<PlantDetailData>) {
+            final data = (state as AppSuccess<PlantDetailData>).data!;
+            return AppSuccess<PlantDetailData>(
+              data.copyWith(isLoadingCvs: true),
+            );
+          }
+          return const AppLoading<PlantDetailData>();
+        } else if (dataState is DataSuccess<CvsComputationResult>) {
+          if (state is AppSuccess<PlantDetailData>) {
+            final data = (state as AppSuccess<PlantDetailData>).data!;
+            return AppSuccess<PlantDetailData>(
+              data.copyWith(
+                climateData: dataState.data!.currentClimate,
+                historicalData: dataState.data!.historicalData,
+                isLoadingCvs: false,
+              ),
+            );
+          }
+          return state;
+        } else {
+          debugPrint('[CVS] Stream failure: ${dataState.exception}');
+          if (state is AppSuccess<PlantDetailData>) {
+            final data = (state as AppSuccess<PlantDetailData>).data!;
+            return AppSuccess<PlantDetailData>(
+              data.copyWith(isLoadingCvs: false),
+            );
+          }
+          return state;
+        }
+      },
+      onError: (error, _) {
+        debugPrint('[CVS] Stream error: $error');
+        if (state is AppSuccess<PlantDetailData>) {
+          final data = (state as AppSuccess<PlantDetailData>).data!;
+          return AppSuccess<PlantDetailData>(
+            data.copyWith(isLoadingCvs: false),
+          );
+        }
+        return state;
+      },
+    );
+  }
+
+  Future<void> _triggerPlantLGSequence(
+    PowerPlant plant,
+    CVSResult cvs,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (lgService.connectionStatus != ConnectionStatus.connected) {
+      debugPrint('[LG] Skipping plant sequence - not connected');
+      return;
+    }
+    // Invalidate any pending region KML injections from ExploreBloc
+    lgService.setKmlContext(DateTime.now().toString());
+    try {
+      debugPrint('[LG] Starting plant sequence for ${plant.name}');
+
+      // 1. Clear screen THEN fly to plant sequentially (to avoid query.txt race condition).
+      await lgService.clearKml();
+      await lgService.flyTo(
+        plant.latitude,
+        plant.longitude,
+        0, 0, 60,
+        _calculateOptimalRange(plant),
+      );
+      debugPrint('[LG] clearKml + flyTo done');
+
+      // 2. Send concentric ring KML with embedded orbit tour.
+      final optimalRange = _calculateOptimalRange(plant);
+      final orbitTour = PowerPlantOrbitService.buildPlantOrbitTour(
+        latitude: plant.latitude,
+        longitude: plant.longitude,
+        range: optimalRange,
+        tilt: 60,
+      );
+      final pinKml = KmlUtils.plantPinKml(
+        plant: plant,
+        riskLevel: cvs.riskLevel,
+        orbitTour: orbitTour,
+      );
+      await lgService.sendKmlToMaster(pinKml);
+      debugPrint('[LG] pinKml sent (with orbit tour)');
+
+      // 3. Load settings once to position the balloon on the correct screen.
+      final settingsResult = await lgService.loadSettings();
+      int rightmostScreen = LGSettings.empty.rightmostScreen;
+      int screenCount = LGSettings.empty.screenCount;
+      if (settingsResult is DataSuccess<LGSettings>) {
+        rightmostScreen = settingsResult.data!.rightmostScreen;
+        screenCount = settingsResult.data!.screenCount;
+      }
+
+      // 4. Offset balloon to rightmost LG screen.
+      const offsetPerSideScreen = 10.0;
+      final sideScreens = (screenCount - 1) / 2;
+      final rawLon = plant.longitude + (offsetPerSideScreen * sideScreens);
+      final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+      // 5. Build + send balloon.
+      ClimateData? currentClimate;
+      if (state is AppSuccess<PlantDetailData>) {
+        currentClimate = (state as AppSuccess<PlantDetailData>).data!.climateData;
+      }
+      final balloonKml = KmlUtils.plantDetailBalloon(
+        plant: plant,
+        cvs: cvs,
+        lat: plant.latitude,
+        lon: adjustedLon,
+        climateData: currentClimate,
+      );
+      await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+      lgService.setCurrentMode(LGDisplayMode.plantDetail);
+      debugPrint('[LG] Plant detail sequence complete for ${plant.name}');
+
+      // Wait 3 seconds for the flyTo animation to finish before enabling
+      // the orbit button. Since plant-to-plant or region-to-plant flights
+      // are typically shorter than global-to-region flights, 3 seconds is usually enough.
+      Future.delayed(const Duration(seconds: 3), () {
+        if (!isClosed) {
+          add(const PlantDetailSetOrbitReady());
+        }
+      });
+    } catch (e, st) {
+      debugPrint('[LG] Plant detail sequence FAILED for ${plant.name}: $e\n$st');
+    }
+  }
+
+
+  Future<void> _onGenerateInsightRequested(
+    PlantDetailGenerateInsightRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (event.isCancel) return;
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    final context = _buildContext();
+    if (context == null) {
+      emit(
+        AppSuccess(
+          currentData.copyWith(
+            insightError:
+                'CVS data not yet available. Please wait for scoring to complete.',
+          ),
+        ),
+      );
+      return;
+    }
+    emit(
+      AppSuccess(
+        currentData.copyWith(isLoadingInsight: true, clearInsightError: true),
+      ),
+    );
+    final insightResult =
+        await generatePlantInsightUsecase(
+          params: {'context': context, 'isUserInitiated': true},
+        ).last.timeout(
+          const Duration(seconds: 12),
+          onTimeout: () => const DataFailure(_TimeoutException()),
+        );
+    if (state is AppSuccess<PlantDetailData> && !(state as AppSuccess<PlantDetailData>).data!.isLoadingInsight) {
+      return; 
+    }
+    if (insightResult is DataSuccess<String>) {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(aiInsight: insightResult.data!, isLoadingInsight: false),
+          ),
+        );
+        if (d.cvsResult != null) {
+          final settingsResult = await lgService.loadSettings();
+          int rightmostScreen = LGSettings.empty.rightmostScreen;
+          int screenCount = LGSettings.empty.screenCount;
+          if (settingsResult is DataSuccess<LGSettings>) {
+            rightmostScreen = settingsResult.data!.rightmostScreen;
+            screenCount = settingsResult.data!.screenCount;
+          }
+          final offsetPerSideScreen = 10.0;
+          final sideScreens = (screenCount - 1) / 2;
+          final rawLon = d.plant.longitude + (offsetPerSideScreen * sideScreens);
+          final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+          
+          final balloonKml = KmlUtils.plantAiInsightBalloon(
+            plant: d.plant,
+            aiInsight: insightResult.data!,
+            lat: d.plant.latitude,
+            lon: adjustedLon,
+          );
+          await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+        }
+      }
+    } else {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              isLoadingInsight: false,
+              insightError:
+                  insightResult.exception?.toString() ?? 'AI insight failed',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _onScenarioInsightRequested(
+    PlantDetailScenarioInsightRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (event.isCancel) return;
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    final context = _buildContext();
+    if (context == null) return;
+    emit(
+      AppSuccess(
+        currentData.copyWith(
+          projectedCvs: event.projectedCvs,
+          isLoadingInsight: true,
+          clearScenarioInsight: true,
+        ),
+      ),
+    );
+    final settingsResult = await lgService.loadSettings();
+    int rightmostScreen = LGSettings.empty.rightmostScreen;
+    int screenCount = LGSettings.empty.screenCount;
+    if (settingsResult is DataSuccess<LGSettings>) {
+      rightmostScreen = settingsResult.data!.rightmostScreen;
+      screenCount = settingsResult.data!.screenCount;
+    }
+    final offsetPerSideScreen = 10.0;
+    final sideScreens = (screenCount - 1) / 2;
+    final rawLon = currentData.plant.longitude + (offsetPerSideScreen * sideScreens);
+    final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+    final loadingBalloonKml = KmlUtils.plantScenarioBalloon(
+      plant: currentData.plant,
+      cvs: currentData.cvsResult!,
+      projectedCvs: event.projectedCvs,
+      scenarioInsight: event.generateAi 
+          ? "Generating Scenario Simulation Analysis... Please wait." 
+          : "Tap the AI Insight button to generate AI analysis for this scenario.",
+      scenarioType: event.scenarioType,
+      lat: currentData.plant.latitude,
+      lon: adjustedLon,
+    );
+    await lgService.showBalloonOnSlave(rightmostScreen, loadingBalloonKml);
+
+    if (!event.generateAi) {
+      emit(AppSuccess(currentData.copyWith(
+          isLoadingInsight: false, 
+          scenarioInsight: "Tap the AI Insight button to generate AI analysis for this scenario.",
+      )));
+      return;
+    }
+
+    final insightResult = await generateScenarioAnalysisUsecase(
+      params: {
+        'context': context,
+        'projectedCvs': event.projectedCvs,
+        'scenarioType': event.scenarioType,
+      },
+    ).last;
+    if (state is AppSuccess<PlantDetailData> && !(state as AppSuccess<PlantDetailData>).data!.isLoadingInsight) {
+      return; 
+    }
+    if (insightResult is DataSuccess<String>) {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              scenarioInsight: insightResult.data!,
+              isLoadingInsight: false,
+            ),
+          ),
+        );
+        if (d.cvsResult != null && event.projectedCvs != null) {
+          final settingsResult = await lgService.loadSettings();
+          int rightmostScreen = LGSettings.empty.rightmostScreen;
+          int screenCount = LGSettings.empty.screenCount;
+          if (settingsResult is DataSuccess<LGSettings>) {
+            rightmostScreen = settingsResult.data!.rightmostScreen;
+            screenCount = settingsResult.data!.screenCount;
+          }
+          final offsetPerSideScreen = 10.0;
+          final sideScreens = (screenCount - 1) / 2;
+          final rawLon = d.plant.longitude + (offsetPerSideScreen * sideScreens);
+          final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+          final balloonKml = KmlUtils.plantScenarioBalloon(
+            plant: d.plant,
+            cvs: d.cvsResult!,
+            projectedCvs: event.projectedCvs,
+            scenarioInsight: insightResult.data!,
+            scenarioType: event.scenarioType,
+            lat: d.plant.latitude,
+            lon: adjustedLon,
+          );
+          await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+        }
+      }
+    } else {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              isLoadingInsight: false,
+              insightError:
+                  insightResult.exception?.toString() ??
+                  'Scenario analysis failed',
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  List<ClimateData> _aggregateByYear(List<ClimateData> rawData) {
+    final Map<int, List<ClimateData>> byYear = {};
+    for (final d in rawData) {
+      byYear.putIfAbsent(d.timestamp.year, () => []).add(d);
+    }
+    return byYear.entries.map((entry) {
+      final year = entry.key;
+      final points = entry.value;
+      final temps = points
+          .where((d) => d.temperature != null)
+          .map((d) => d.temperature!)
+          .toList();
+      final precips = points
+          .where((d) => d.precipitation != null)
+          .map((d) => d.precipitation!)
+          .toList();
+      final winds = points
+          .where((d) => d.windSpeed != null)
+          .map((d) => d.windSpeed!)
+          .toList();
+      return ClimateData(
+        latitude: points.first.latitude,
+        longitude: points.first.longitude,
+        timestamp: DateTime(year, 7, 1),
+        temperature: temps.isNotEmpty
+            ? temps.reduce((a, b) => a + b) / temps.length
+            : null,
+        precipitation: precips.isNotEmpty
+            ? precips.reduce((a, b) => a + b) / precips.length
+            : null,
+        windSpeed: winds.isNotEmpty
+            ? winds.reduce((a, b) => a + b) / winds.length
+            : null,
+      );
+    }).toList()..sort((a, b) => a.timestamp.compareTo(b.timestamp));
+  }
+
+  Future<void> _onTrendRequested(
+    PlantDetailTrendRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    if (currentData.trendData.isNotEmpty) {
+      final settingsResult = await lgService.loadSettings();
+      int rightmostScreen = LGSettings.empty.rightmostScreen;
+      int screenCount = LGSettings.empty.screenCount;
+      if (settingsResult is DataSuccess<LGSettings>) {
+        rightmostScreen = settingsResult.data!.rightmostScreen;
+        screenCount = settingsResult.data!.screenCount;
+      }
+      final offsetPerSideScreen = 10.0;
+      final sideScreens = (screenCount - 1) / 2;
+      final rawLon = currentData.plant.longitude + (offsetPerSideScreen * sideScreens);
+      final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+      final balloonKml = KmlUtils.plantTrendBalloon(
+        plant: currentData.plant,
+        trendData: currentData.trendData,
+        lat: currentData.plant.latitude,
+        lon: adjustedLon,
+      );
+      await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+      return;
+    }
+    if (currentData.isLoadingTrend) {
+      return;
+    }
+    emit(AppSuccess(currentData.copyWith(isLoadingTrend: true)));
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final modeIndex =
+          prefs.getInt('historical_data_mode') ?? HistoricalDataMode.fast.index;
+      final mode = HistoricalDataMode.values[modeIndex];
+      final now = DateTime.now();
+      final trendResult = await getMultiYearTrendUsecase(
+        params: {
+          'lat': event.plant.latitude,
+          'lon': event.plant.longitude,
+          'startDate': mode.startDate,
+          'endDate': DateTime(now.year, 1, 1).subtract(const Duration(days: 1)),
+        },
+      ).last.timeout(const Duration(seconds: 75));
+      if (trendResult is DataSuccess<List<ClimateData>>) {
+        final aggregatedData = _aggregateByYear(trendResult.data!);
+        if (state is AppSuccess<PlantDetailData>) {
+          final d = (state as AppSuccess<PlantDetailData>).data!;
+          emit(
+            AppSuccess(
+              d.copyWith(trendData: aggregatedData, isLoadingTrend: false),
+            ),
+          );
+          
+          final settingsResult = await lgService.loadSettings();
+          int rightmostScreen = LGSettings.empty.rightmostScreen;
+          int screenCount = LGSettings.empty.screenCount;
+          if (settingsResult is DataSuccess<LGSettings>) {
+            rightmostScreen = settingsResult.data!.rightmostScreen;
+            screenCount = settingsResult.data!.screenCount;
+          }
+          final offsetPerSideScreen = 10.0;
+          final sideScreens = (screenCount - 1) / 2;
+          final rawLon = d.plant.longitude + (offsetPerSideScreen * sideScreens);
+          final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+          final balloonKml = KmlUtils.plantTrendBalloon(
+            plant: d.plant,
+            trendData: aggregatedData,
+            lat: d.plant.latitude,
+            lon: adjustedLon,
+          );
+          await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+        }
+      } else {
+        debugPrint('[Trend] Failed: ${trendResult.exception}');
+        if (state is AppSuccess<PlantDetailData>) {
+          final d = (state as AppSuccess<PlantDetailData>).data!;
+          emit(AppSuccess(d.copyWith(isLoadingTrend: false)));
+        }
+      }
+    } catch (e) {
+      debugPrint('[Trend] Error: $e');
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(AppSuccess(d.copyWith(isLoadingTrend: false)));
+      }
+    }
+  }
+
+  Future<void> _onTrendInsightRequested(
+    PlantDetailTrendInsightRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (event.isCancel) return;
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    final context = _buildContext();
+    if (context == null) return;
+    emit(AppSuccess(currentData.copyWith(isLoadingTrendInsight: true)));
+    final result = await generateTrendInsightUsecase(params: context).last
+        .timeout(
+          const Duration(seconds: 12),
+          onTimeout: () => const DataFailure(_TimeoutException()),
+        );
+    if (result is DataSuccess<String>) {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              trendInsight: result.data!,
+              isLoadingTrendInsight: false,
+            ),
+          ),
+        );
+      }
+    } else {
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(AppSuccess(d.copyWith(isLoadingTrendInsight: false)));
+      }
+    }
+  }
+
+  
+  Future<void> _onDismissInsight(
+    PlantDetailDismissInsight event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    
+    // Dispatch cancel events to cleanly abort any ongoing AI generation streams
+    add(const PlantDetailGenerateInsightRequested(isCancel: true));
+    add(const PlantDetailScenarioInsightRequested(isCancel: true));
+    add(const PlantDetailTrendInsightRequested(isCancel: true));
+    
+    emit(AppSuccess(currentData.copyWith(
+      clearAiInsight: true,
+      clearScenarioInsight: true,
+      isLoadingInsight: false,
+      clearInsightError: true,
+    )));
+
+    int rightmostScreen = LGSettings.empty.rightmostScreen;
+    int screenCount = LGSettings.empty.screenCount;
+    final settingsResult = await lgService.loadSettings();
+    if (settingsResult is DataSuccess<LGSettings>) {
+      rightmostScreen = settingsResult.data!.rightmostScreen;
+      screenCount = settingsResult.data!.screenCount;
+    }
+    final offsetPerSideScreen = 10.0;
+    final sideScreens = (screenCount - 1) / 2;
+    final rawLon = currentData.plant.longitude + (offsetPerSideScreen * sideScreens);
+    final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+    
+    final balloonKml = KmlUtils.plantDetailBalloon(
+      plant: currentData.plant,
+      cvs: currentData.cvsResult!,
+      lat: currentData.plant.latitude,
+      lon: adjustedLon,
+    );
+    await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+  }
+
+  Future<void> _onChatStarted(
+    PlantDetailChatStarted event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    final context = _buildContext();
+    if (context == null) return;
+    _chatSessionId = startPlantChatUsecase(context: context);
+    emit(
+      AppSuccess(currentData.copyWith(isChatActive: true, chatMessages: [])),
+    );
+  }
+
+  Future<void> _onChatEnded(
+    PlantDetailChatEnded event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is AppSuccess<PlantDetailData>) {
+      try {
+        final settingsResult = await lgService.loadSettings();
+        int rightmostScreen = 5;
+        if (settingsResult is DataSuccess<LGSettings>) {
+          rightmostScreen = settingsResult.data!.rightmostScreen;
+        }
+        await lgService.clearBalloonOnSlave(rightmostScreen);
+      } catch (e) {
+        debugPrint('[LG] Failed to clear chat balloon: $e');
+      }
+    }
+  }
+
+  Future<void> _onChatMessageSent(
+    PlantDetailChatMessageSent event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData> || _chatSessionId == null) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    final userMessage = ChatMessage(text: event.message, isUser: true);
+    final updatedMessages = [...currentData.chatMessages, userMessage];
+    emit(
+      AppSuccess(
+        currentData.copyWith(
+          chatMessages: updatedMessages,
+          isChatLoading: true,
+        ),
+      ),
+    );
+    final result = await sendChatMessageUsecase(
+      params: {'sessionId': _chatSessionId!, 'message': event.message},
+    ).last;
+    if (result is DataSuccess<String>) {
+      final aiMessage = ChatMessage(text: result.data!, isUser: false);
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              chatMessages: [...d.chatMessages, aiMessage],
+              isChatLoading: false,
+            ),
+          ),
+        );
+
+        // Send the AI response as a KML balloon to the LG rightmost screen.
+        try {
+          final settingsResult = await lgService.loadSettings();
+          int rightmostScreen = LGSettings.empty.rightmostScreen;
+          int screenCount = LGSettings.empty.screenCount;
+          if (settingsResult is DataSuccess<LGSettings>) {
+            rightmostScreen = settingsResult.data!.rightmostScreen;
+            screenCount = settingsResult.data!.screenCount;
+          }
+          final offsetPerSideScreen = 10.0;
+          final sideScreens = (screenCount - 1) / 2;
+          final rawLon = d.plant.longitude + (offsetPerSideScreen * sideScreens);
+          final adjustedLon = rawLon > 180.0 ? rawLon - 360.0 : rawLon;
+
+          final balloonKml = KmlUtils.chatResponseBalloon(
+            plant: d.plant,
+            userQuestion: event.message,
+            aiResponse: result.data!,
+            lat: d.plant.latitude,
+            lon: adjustedLon,
+          );
+          await lgService.showBalloonOnSlave(rightmostScreen, balloonKml);
+        } catch (e) {
+          debugPrint('[LG] Failed to send chat balloon: $e');
+        }
+      }
+    } else {
+      final errorMessage = ChatMessage(
+        text: 'Sorry, I encountered an error. Please try again.',
+        isUser: false,
+      );
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(
+          AppSuccess(
+            d.copyWith(
+              chatMessages: [...d.chatMessages, errorMessage],
+              isChatLoading: false,
+            ),
+          ),
+        );
+      }
+    }
+  }
+
+  Future<void> _onStartOrbitRequested(
+    PlantDetailStartOrbitRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    
+    emit(AppSuccess(currentData.copyWith(isOrbiting: true)));
+
+    try {
+      final result = await lgService.startPlantOrbit();
+      if (result is DataFailure<void>) {
+        if (state is AppSuccess<PlantDetailData>) {
+          final d = (state as AppSuccess<PlantDetailData>).data!;
+          emit(AppSuccess(d.copyWith(isOrbiting: false)));
+        }
+      }
+    } catch (e) {
+      debugPrint('[LG] Failed to start orbit: $e');
+      if (state is AppSuccess<PlantDetailData>) {
+        final d = (state as AppSuccess<PlantDetailData>).data!;
+        emit(AppSuccess(d.copyWith(isOrbiting: false)));
+      }
+    }
+  }
+
+  Future<void> _onStopOrbitRequested(
+    PlantDetailStopOrbitRequested event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) async {
+    if (state is! AppSuccess<PlantDetailData>) return;
+    final currentData = (state as AppSuccess<PlantDetailData>).data!;
+    emit(AppSuccess(currentData.copyWith(isOrbiting: false)));
+    await lgService.stopPlantOrbit();
+  }
+
+  void _onSetOrbitReady(
+    PlantDetailSetOrbitReady event,
+    Emitter<AppState<PlantDetailData>> emit,
+  ) {
+    if (state is AppSuccess<PlantDetailData>) {
+      final data = (state as AppSuccess<PlantDetailData>).data!;
+      emit(AppSuccess(data.copyWith(isOrbitReady: true)));
+    }
+  }
+
+  double _calculateOptimalRange(PowerPlant plant) {
+    double baseRange = 800;
+    if (plant.capacityMw != null) {
+      baseRange += 40 * math.sqrt(plant.capacityMw!);
+    }
+    switch (plant.primaryFuel) {
+      case PlantType.hydro:
+        baseRange *= 1.5;
+        break;
+      case PlantType.nuclear:
+        baseRange *= 1.2;
+        break;
+      case PlantType.solar:
+        baseRange *= 1.3;
+        break;
+      case PlantType.wind:
+        baseRange *= 2.0;
+        break;
+      default:
+        break;
+    }
+    if (baseRange < 400) return 400;
+    if (baseRange > 15000) return 15000;
+    return baseRange;
+  }
+}
+
+class _TimeoutException implements Exception {
+  const _TimeoutException();
+  @override
+  String toString() => 'Request timed out. Please try again.';
+}
