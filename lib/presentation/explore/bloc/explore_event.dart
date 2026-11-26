@@ -1,0 +1,94 @@
+import 'package:equatable/equatable.dart';
+import '../../../domain/model/region.dart';
+import '../../../domain/model/power_plant.dart';
+import '../../../core/enums/plant_type.dart';
+import '../../../core/enums/risk_level.dart';
+import '../../../core/enums/stress_filter.dart';
+
+abstract class ExploreEvent extends Equatable {
+  const ExploreEvent();
+  @override
+  List<Object?> get props => [];
+}
+
+class ExploreRegionLoaded extends ExploreEvent {
+  final Region region;
+  const ExploreRegionLoaded(this.region);
+  @override
+  List<Object?> get props => [region];
+}
+
+class ExploreGlobalLoaded extends ExploreEvent {
+  const ExploreGlobalLoaded();
+}
+
+class ExploreFilterChanged extends ExploreEvent {
+  final PlantType? typeFilter;
+  final StressFilter? stressFilter;
+  final bool clearTypeFilter;
+  final bool clearStressFilter;
+  const ExploreFilterChanged({
+    this.typeFilter,
+    this.stressFilter,
+    this.clearTypeFilter = false,
+    this.clearStressFilter = false,
+  });
+  @override
+  List<Object?> get props => [
+    typeFilter,
+    stressFilter,
+    clearTypeFilter,
+    clearStressFilter,
+  ];
+}
+
+class ExplorePlantSelected extends ExploreEvent {
+  final PowerPlant plant;
+  const ExplorePlantSelected(this.plant);
+  @override
+  List<Object?> get props => [plant];
+}
+
+class ExploreSearchQueryChanged extends ExploreEvent {
+  final String query;
+  const ExploreSearchQueryChanged(this.query);
+  @override
+  List<Object?> get props => [query];
+}
+
+class ExploreSetOrbitReady extends ExploreEvent {
+  const ExploreSetOrbitReady();
+}
+
+class ExploreLoadMore extends ExploreEvent {
+  const ExploreLoadMore();
+}
+
+class ExploreRiskFilterChanged extends ExploreEvent {
+  final RiskLevel? riskLevel;
+  const ExploreRiskFilterChanged({this.riskLevel});
+  @override
+  List<Object?> get props => [riskLevel];
+}
+
+class ExploreGenerateRegionalInsight extends ExploreEvent {
+  const ExploreGenerateRegionalInsight();
+}
+
+
+
+class ExploreLGRestoreRequested extends ExploreEvent {
+  const ExploreLGRestoreRequested();
+}
+
+class ExploreDismissInsight extends ExploreEvent {
+  const ExploreDismissInsight();
+}
+
+class ExploreStartOrbit extends ExploreEvent {
+  const ExploreStartOrbit();
+}
+
+class ExploreStopOrbit extends ExploreEvent {
+  const ExploreStopOrbit();
+}
